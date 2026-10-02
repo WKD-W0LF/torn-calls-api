@@ -1,21 +1,20 @@
 const express = require("express");
 const helmet = require("helmet");
 const { Pool } = require("pg");
+const https = require("https");
 
 const PORT = Number(process.env.PORT || 3000);
-const API_TOKEN = process.env.API_TOKEN || "";
+const FACTION_ID = Number(process.env.FACTION_ID || 56966);
 const CLAIM_TTL_SECONDS = Number(process.env.CLAIM_TTL_SECONDS || 90);
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "https://www.torn.com";
+// How long (ms) to cache a valid Torn API key verification result
+const AUTH_CACHE_TTL_MS = Number(process.env.AUTH_CACHE_TTL_MS || 60000);
 
 for (const key of ["PGHOST", "PGPORT", "PGDATABASE", "PGUSER", "PGPASSWORD"]) {
   if (!process.env[key]) {
     console.error(`Missing required environment variable: ${key}`);
     process.exit(1);
   }
-}
-if (!API_TOKEN) {
-  console.error("Missing required environment variable: API_TOKEN");
-  process.exit(1);
 }
 
 const pool = new Pool({
@@ -43,8 +42,56 @@ app.use((req, res, next) => {
   next();
 });
 
-function requireAuth(req, res, next) {
-  if ((req.get("authorization") || "") !== `Bearer ${API_TOKEN}`) {
+// --- Torn API faction membership verification with short-lived cache ---
+const authCache = new Map(); // apiKey -> { valid: bool, expiresAt: Date.now() }
+
+function tornApiGet(path) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(`https://api.torn.com${path}`, { timeout: 8000 }, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk; });
+      res.on("end", () => {
+        try { resolve(JSON.parse(body)); }
+        catch (e) { reject(new Error("Invalid JSON from Torn API")); }
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Torn API timeout")); });
+  });
+}
+
+async function verifyFactionMembership(apiKey) {
+  const cached = authCache.get(apiKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.valid;
+
+  try {
+    const data = await tornApiGet(`/user/?selections=profile&key=${apiKey}`);
+    // Torn API error codes: https://www.torn.com/api.html
+    if (data.error) {
+      console.warn(`Torn API error for key verification: ${data.error.error} (code ${data.error.code})`);
+      authCache.set(apiKey, { valid: false, expiresAt: Date.now() + 10000 }); // short cache for errors
+      return false;
+    }
+    const valid = data.faction && data.faction.faction_id === FACTION_ID;
+    authCache.set(apiKey, { valid, expiresAt: Date.now() + AUTH_CACHE_TTL_MS });
+    return valid;
+  } catch (err) {
+    console.error("Torn API verification failed:", err.message);
+    return false;
+  }
+}
+
+async function requireAuth(req, res, next) {
+  const auth = req.get("authorization") || "";
+  if (!auth.startsWith("Bearer ")) {
+    return res.status(401).json({ success: false, error: "unauthorized" });
+  }
+  const apiKey = auth.slice(7).trim();
+  if (!apiKey) {
+    return res.status(401).json({ success: false, error: "unauthorized" });
+  }
+  const valid = await verifyFactionMembership(apiKey);
+  if (!valid) {
     return res.status(401).json({ success: false, error: "unauthorized" });
   }
   next();
@@ -109,7 +156,9 @@ app.get("/api/v1/calls", requireAuth, async (_req, res) => {
 
 app.post("/api/v1/calls", requireAuth, async (req, res) => {
   const { targetId, targetName, calledById, calledByName, priority = false, assistRequested = false } = req.body || {};
-  if (!/^\d+$/.test(String(targetId || "")) || !/^\d+$/.test(String(calledById || "")) || !String(targetName || "").trim() || !String(calledByName || "").trim() || typeof priority !== "boolean" || typeof assistRequested !== "boolean") {
+  if (!/^\d+$/.test(String(targetId || "")) || !/^\d+$/.test(String(calledById || "")) ||
+      !String(targetName || "").trim() || !String(calledByName || "").trim() ||
+      typeof priority !== "boolean" || typeof assistRequested !== "boolean") {
     return res.status(400).json({ success: false, error: "invalid_request" });
   }
 
@@ -120,26 +169,17 @@ app.post("/api/v1/calls", requireAuth, async (req, res) => {
     const result = await client.query(`
       INSERT INTO torn_target_calls
         (target_id, target_name, called_by_id, called_by_name, expires_at, priority, assist_requested)
-      VALUES
-        ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'), $6, $7)
+      VALUES ($1, $2, $3, $4, NOW() + ($5 * INTERVAL '1 second'), $6, $7)
       ON CONFLICT (target_id) DO NOTHING
-      RETURNING
-        target_id::text AS "targetId",
-        target_name AS "targetName",
-        called_by_id::text AS "calledById",
-        called_by_name AS "calledByName",
-        called_at AS "calledAt",
-        expires_at AS "expiresAt",
-        priority AS "priority",
-        assist_requested AS "assistRequested"
-    `, [String(targetId), String(targetName).trim().slice(0, 64), String(calledById), String(calledByName).trim().slice(0, 64), CLAIM_TTL_SECONDS, priority, assistRequested]);
+      RETURNING ${callSelect.replace(/\s+FROM torn_target_calls\s*$/, "").trim().replace(/^\s*SELECT\s+/, "")}
+    `, [String(targetId), String(targetName).trim().slice(0, 64), String(calledById),
+        String(calledByName).trim().slice(0, 64), CLAIM_TTL_SECONDS, priority, assistRequested]);
 
     if (result.rowCount === 0) {
       const existing = await client.query(`${callSelect} WHERE target_id = $1`, [String(targetId)]);
       await client.query("COMMIT");
       return res.status(409).json({ success: false, error: "already_called", call: existing.rows[0] || null });
     }
-
     await client.query("COMMIT");
     res.status(201).json({ success: true, call: result.rows[0] });
   } catch (error) {
@@ -154,32 +194,19 @@ app.post("/api/v1/calls", requireAuth, async (req, res) => {
 app.patch("/api/v1/calls/:targetId", requireAuth, async (req, res) => {
   const targetId = String(req.params.targetId || "");
   const { priority, assistRequested } = req.body || {};
-
   if (!/^\d+$/.test(targetId)) return res.status(400).json({ success: false, error: "invalid_target_id" });
   if (priority === undefined && assistRequested === undefined) return res.status(400).json({ success: false, error: "no_updates_supplied" });
   if ((priority !== undefined && typeof priority !== "boolean") || (assistRequested !== undefined && typeof assistRequested !== "boolean")) {
     return res.status(400).json({ success: false, error: "invalid_request" });
   }
-
   try {
     await removeExpired();
     const result = await pool.query(`
       UPDATE torn_target_calls
-      SET
-        priority = COALESCE($2, priority),
-        assist_requested = COALESCE($3, assist_requested)
+      SET priority = COALESCE($2, priority), assist_requested = COALESCE($3, assist_requested)
       WHERE target_id = $1
-      RETURNING
-        target_id::text AS "targetId",
-        target_name AS "targetName",
-        called_by_id::text AS "calledById",
-        called_by_name AS "calledByName",
-        called_at AS "calledAt",
-        expires_at AS "expiresAt",
-        priority AS "priority",
-        assist_requested AS "assistRequested"
+      RETURNING ${callSelect.replace(/\s+FROM torn_target_calls\s*$/, "").trim().replace(/^\s*SELECT\s+/, "")}
     `, [targetId, priority ?? null, assistRequested ?? null]);
-
     if (result.rowCount === 0) return res.status(404).json({ success: false, error: "call_not_found" });
     res.json({ success: true, call: result.rows[0] });
   } catch (error) {
@@ -220,9 +247,6 @@ async function start() {
   }
 }
 
-process.on("SIGTERM", async () => {
-  await pool.end();
-  process.exit(0);
-});
+process.on("SIGTERM", async () => { await pool.end(); process.exit(0); });
 
 start();
